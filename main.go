@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
+	cbs "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cbs/v20170312"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
@@ -26,17 +27,20 @@ const (
 	NameSpace = "tc_info"
 )
 
-type Exporter struct {
-	logger    log.Logger
-	rateLimit int
+type EsExporter struct {
+	logger     log.Logger
+	rateLimit  int
+	credential common.CredentialIface
 
 	esInstance *prometheus.Desc
 }
 
-func NewExporter(rateLimit int, logger log.Logger) *Exporter {
-	return &Exporter{
-		logger:    logger,
-		rateLimit: rateLimit,
+func NewEsExporter(rateLimit int, logger log.Logger, credential common.CredentialIface) *EsExporter {
+	return &EsExporter{
+		logger:     logger,
+		rateLimit:  rateLimit,
+		credential: credential,
+
 		esInstance: prometheus.NewDesc(
 			prometheus.BuildFQName(NameSpace, "es", "instance"),
 			"elastic instance on tencent cloud",
@@ -46,26 +50,20 @@ func NewExporter(rateLimit int, logger log.Logger) *Exporter {
 	}
 }
 
-func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+func (e *EsExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.esInstance
 }
 
-func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	// 连接腾讯云
-	provider := common.DefaultEnvProvider()
-	credential, err := provider.GetCredential()
-	if err != nil {
-		_ = level.Error(e.logger).Log("msg", "Failed to get credential")
-		panic(err)
-	}
-	client, err := es.NewClient(credential, regions.Beijing, profile.NewClientProfile())
+func (e *EsExporter) Collect(ch chan<- prometheus.Metric) {
+	// es collect
+	esClient, err := es.NewClient(e.credential, regions.Beijing, profile.NewClientProfile())
 	if err != nil {
 		_ = level.Error(e.logger).Log("msg", "Failed to get tencent client")
 		panic(err)
 	}
 
-	request := es.NewDescribeInstancesRequest()
-	response, err := client.DescribeInstances(request)
+	esRequest := es.NewDescribeInstancesRequest()
+	esResponse, err := esClient.DescribeInstances(esRequest)
 
 	if _, ok := err.(*errors.TencentCloudSDKError); ok {
 		fmt.Printf("An API error has returned: %s", err)
@@ -75,9 +73,70 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		panic(err)
 	}
 	// 暴露指标
-	for _, ins := range response.Response.InstanceList {
+	for _, ins := range esResponse.Response.InstanceList {
 		ch <- prometheus.MustNewConstMetric(e.esInstance, prometheus.GaugeValue, 1,
 			[]string{*ins.InstanceId, *ins.InstanceName, *ins.EsVersion}...)
+	}
+}
+
+type CbsExporter struct {
+	logger     log.Logger
+	rateLimit  int
+	credential common.CredentialIface
+
+	cbsInstance *prometheus.Desc
+}
+
+func NewCbsExporter(rateLimit int, logger log.Logger, credential common.CredentialIface) *CbsExporter {
+	return &CbsExporter{
+		logger:     logger,
+		rateLimit:  rateLimit,
+		credential: credential,
+
+		cbsInstance: prometheus.NewDesc(
+			prometheus.BuildFQName(NameSpace, "cbs", "instance"),
+			"cbs instance on tencent cloud",
+			[]string{"instance_id", "disk_id", "type", "name", "state"},
+			nil,
+		),
+	}
+}
+
+func (e *CbsExporter) Describe(ch chan<- *prometheus.Desc) {
+	ch <- e.cbsInstance
+}
+
+func (e *CbsExporter) Collect(ch chan<- prometheus.Metric) {
+	// cbs collect
+	cbsClient, err := cbs.NewClient(e.credential, regions.Beijing, profile.NewClientProfile())
+	if err != nil {
+		_ = level.Error(e.logger).Log("msg", "Failed to get tencent client")
+		panic(err)
+	}
+	cbsRequest := cbs.NewDescribeDisksRequest()
+	cbsRequest.Limit = common.Uint64Ptr(100)
+	cbsResponse, err := cbsClient.DescribeDisks(cbsRequest)
+
+	if _, ok := err.(*errors.TencentCloudSDKError); ok {
+		fmt.Printf("An API error has returned: %s", err)
+		return
+	}
+	if err != nil {
+		panic(err)
+	}
+	cbsTotal := *cbsResponse.Response.TotalCount
+	var count = uint64(0)
+	for {
+		if count > cbsTotal {
+			break
+		}
+		for _, disk := range cbsResponse.Response.DiskSet {
+			ch <- prometheus.MustNewConstMetric(e.cbsInstance, prometheus.GaugeValue, 1,
+				[]string{*disk.InstanceId, *disk.DiskId, *disk.InstanceType, *disk.DiskName, *disk.DiskState}...)
+		}
+		count += 100
+		cbsRequest.Offset = common.Uint64Ptr(count)
+		cbsResponse, err = cbsClient.DescribeDisks(cbsRequest)
 	}
 }
 
@@ -86,6 +145,8 @@ func main() {
 		webConfig     = webflag.AddFlags(kingpin.CommandLine)
 		listenAddress = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9150").String()
 		metricsPath   = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		enableEs      = kingpin.Arg("metrics.es", "Enable metric es").Bool()
+		enableCbs     = kingpin.Arg("metrics.cbs", "Enable metric cbs").Bool()
 	)
 	promlogConfig := &promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promlogConfig)
@@ -102,8 +163,21 @@ func main() {
 	_ = level.Info(logger).Log("msg", "Starting tc_info_exporter", "version", version.Info())
 	_ = level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
+	// 连接腾讯云
+	provider := common.DefaultEnvProvider()
+	credential, err := provider.GetCredential()
+	if err != nil {
+		_ = level.Error(logger).Log("msg", "Failed to get credential")
+		panic(err)
+	}
+
 	prometheus.MustRegister(version.NewCollector(NameSpace))
-	prometheus.MustRegister(NewExporter(15, logger))
+	if *enableCbs {
+		prometheus.MustRegister(NewCbsExporter(15, logger, credential))
+	}
+	if *enableEs {
+		prometheus.MustRegister(NewEsExporter(15, logger, credential))
+	}
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
