@@ -124,6 +124,9 @@ func (e *CbsExporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	if err != nil {
+		if cbsResponse != nil {
+			fmt.Printf("The API request id: %s ", *cbsResponse.Response.RequestId)
+		}
 		panic(err)
 	}
 	cbsTotal := *cbsResponse.Response.TotalCount
@@ -147,6 +150,9 @@ func (e *CbsExporter) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 		if err != nil {
+			if cbsResponse != nil {
+				fmt.Printf("The API request id: %s ", *cbsResponse.Response.RequestId)
+			}
 			panic(err)
 		}
 		for _, disk := range cbsResponse.Response.DiskSet {
